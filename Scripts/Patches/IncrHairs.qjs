@@ -1,0 +1,469 @@
+/**************************************************************************\
+*                                                                          *
+*   Copyright (C) 2013-2021 Ai4rei/AN                                      *
+*   Copyright (C) 2013-2022 Neo-Mind                                       *
+*                                                                          *
+*   This file is a part of WARP project (specific to RO clients)           *
+*                                                                          *
+*   WARP is free software: you can redistribute it and/or modify           *
+*   it under the terms of the GNU General Public License as published by   *
+*   the Free Software Foundation, either version 3 of the License, or      *
+*   (at your option) any later version.                                    *
+*                                                                          *
+*   This program is distributed in the hope that it will be useful,        *
+*   but WITHOUT ANY WARRANTY; without even the implied warranty of         *
+*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the          *
+*   GNU General Public License for more details.                           *
+*                                                                          *
+*   You should have received a copy of the GNU General Public License      *
+*   along with this program.  If not, see <http://www.gnu.org/licenses/>.  *
+*                                                                          *
+*                                                                          *
+|**************************************************************************|
+*                                                                          *
+*   Author(s)     : Ai4rei/AN, Neo-Mind                                    *
+*   Created Date  : 2021-02-24                                             *
+*   Last Modified : 2022-08-23                                             *
+*                                                                          *
+\**************************************************************************/
+
+///
+/// \brief Makes the respective sprites & palettes use the acutal numbers instead of the hard-coded tables.
+///
+IncrHairs = function(patchName)
+{
+	this.stage1(patchName); //for the head sprites & palettes
+	if (Exe.Version > 6)
+		this.stage2(patchName); //for the mid-headgear sprites dependent on hairstyles.
+
+	return true;
+};
+
+///
+/// \brief Ignores the hard-coded hair style table and generate hair style IDs ad-hoc instead
+///
+IncrHairs.stage1 = patchName =>
+{
+	const _ = patchName + ' (Stage 1) : ';
+
+	$$(_ + '1.1 - Find the format strings using a common part')
+	const addrs = Exe.FindTextN("\\\xB8\xD3\xB8\xAE\xC5\xEB\\%s\\%s", PHYSICAL, false, false);
+	if (addrs.isEmpty())
+		throw Error("Format string(s) missing");
+
+	$$(_ + '1.2 - Extract the string addresses')
+	const strAddrs = addrs.map(addr => (Exe.GetUint8(addr - 1) > 0 ? addr - 6 : addr));
+
+	$$(_ + '1.3 - Detect newer clients with Doram')
+	const doramOn = addrs[0] == strAddrs[0];
+
+	$$(_ + '1.4 - Find the format string for the palette (unless shared head palette is ON)')
+	let addr = -1;
+	const fmtPrefix = "\xB8\xD3\xB8\xAE\\\xB8\xD3\xB8\xAE";
+	if (Exe.Version <= 9) //VC6 & VC9
+		addr = Exe.FindText(fmtPrefix + "%s%s_%d.pal", PHYSICAL); //Old style used for VC6 and some initial VC9 clients
+
+	if (addr < 0)
+		addr = Exe.FindText(fmtPrefix + "%s_%s_%d.pal", PHYSICAL); //New style
+
+	if (addr < 0)
+		throw Error("Palette format string missing");
+
+	$$(_ + '1.5 - Add to the strAddrs')
+	strAddrs.push(addr);
+
+	$$(_ + '1.6 - Get the status of shared head palette patches')
+	const isPalShared = Warp.GetPatchState("HeadPalMF") || Warp.GetPatchState("HeadPalUnisex");
+
+	$$(_ + '1.7 - Get the limit from user or set it to 65k based on the patch')
+	let maxHairs;
+	switch (patchName)
+	{
+		case "IncrHairStyles":
+		{
+			maxHairs = Exe.GetUserInput('$maxHairs', D_Uint16, "Limit input", "Enter the maximum no of hairstyles", 100, {saveDefault: true});
+			if (maxHairs === false)
+				Cancel("Limit reverted to default");
+
+			break;
+		}
+		case "Allow65kHairs":
+		{
+			maxHairs = 65535;
+			break;
+		}
+		default:
+		{
+			maxHairs = CACHE.get('IH_Max');
+			break;
+		}
+	}
+	CACHE.put('IH_Max', maxHairs);
+
+	$$(_ + '2 - Prep the lambda function for fixing comparisons')
+	const fixCmp = (addr) =>
+	{
+		if (maxHairs === 65535)
+		{
+			$$(_ + '2.1 - For highest limit just enforce the conditional jump after the CMP')
+			Exe.SetJMP(addr + 3);
+		}
+
+		else if (maxHairs <= 0x7F)
+		{
+			$$(_ + '2.2 - For 1 byte limits directly alter the limit value used')
+			Exe.SetInt16(addr + 2, maxHairs | 0x7C00); //7C to make it JLE in case it isnt.
+		}
+
+		else
+		{
+			$$(_ + '2.3 - For multi byte limits, extract the register used')
+			const reg = R32.List[Exe.GetUint8(addr + 1) & 0x7];
+
+			$$(_ + '2.4 - Construct the code for comparison')
+			code =
+				CMP(reg, maxHairs) //cmp reg, <maxHairs>
+			+	JA(Filler(1))    //ja <defAddr>
+			+	JMP(Filler(2))   //jmp <validAddr>
+			;
+
+			$$(_ + '2.5 - Prepare the arguments for auto-hook')
+			const args =
+			{
+				snap : 1,
+				targets : {
+					1 : Exe.Phy2Vir(addr + 5, CODE),
+				    2 : Exe.GetTgtAddr(addr + 4, 1)
+				}
+			};
+
+			$$(_ + '2.6 - Add our code and jump to it from addr')
+			AutoHook(addr, code, args);
+		}
+
+		$$(_ + '2.9 - Change the default value to 2 instead of 0D or 6')
+		let ins = Instr.FromAddr(addr + 5);
+		ins.Immd = 2;
+		Exe.SetHex(ins.Addr, ins);
+	};
+
+	$$(_ + '3 - Prep the lambda function for table fixes')
+	const fixTbl = (addr) =>
+	{
+		$$(_ + '3.1 - Extract the instruction')
+		let ins = Instr.FromAddr(addr);
+
+		$$(_ + '3.2 - Update the ModRM to not use the 4*reg part')
+		ins.MRM.update(null, null, ins.SIB.Base);
+
+		$$(_ + '3.3 - Change the SIB to 90h (quick hack to set a NOP at end)')
+		ins.SIB.Data = 0x90;
+
+		$$(_ + '3.4 - Replace the instruction')
+		Exe.SetHex(ins.Addr, ins);
+	};
+
+	strAddrs.forEach( (memAddr, idx) =>
+	{
+		const __ = `${_} [${idx}] `;
+
+		const isLast = idx === strAddrs.length-1;
+
+		if (!isLast || !isPalShared)
+		{
+			$$(__ + '4.1 - Retrieve the string & get the position of the 2nd %s')
+			const fmt = Exe.GetText(memAddr);
+			const pos = fmt.indexOf("%s", isLast ? 0 : fmt.indexOf("%s") + 1);
+
+			$$(__ + '4.2 - Change the %s to %u')
+			Exe.SetInt8(memAddr + pos + 1, 0x75);
+		}
+
+		$$(__ + '4.3 - Find where the string is used in a PUSH')
+		const strVir = Exe.Phy2Vir(memAddr);
+		const hookAddr = Exe.FindHex(PUSH(strVir));
+		if (hookAddr < 0)
+			throw Error("Format string not used");
+
+		$$(__ + '4.4 - Retrieve the stack register')
+		const sreg = ROC.StkReg; //EBP or ESP depending on FP
+
+		$$(__ + '4.5 - Find the start of the function')
+		let code, addr = -1, type; //type is used to find the stack offset later
+		if (Exe.BuildDate < 20111000)
+		{
+			code = '';
+			if (ROC.HasFP)
+			{
+				code +=
+					FP_START               //push ebp
+					                       //mov ebp, esp
+				;
+			}
+			else
+			{
+				code +=
+					isLast
+				?	INT3                   //int3
+					                       // OR
+				:	PUSH_R                 //push regA
+				;
+			}
+
+			code +=
+				MOV(R32, [sreg, ' 0?']) //mov regA, dword ptr [ARG.2] or [ARG.1]
+			;
+
+			addr = Exe.FindLastHex(code, hookAddr, hookAddr - 0x200);
+			type = 1;
+		}
+		if (addr < 0)
+		{
+			code =
+				PUSH(-1)                //push -1
+			+	PUSH(POS3WC)            //push offset#1
+			+	MOV(EAX, FS, [0])       //mov eax, dword ptr fs:[0]
+			+	PUSH_EAX                //push eax
+			;
+
+			addr = Exe.FindLastHex(code, hookAddr, hookAddr - 0x400);
+			type = 2;
+		}
+		if (addr < 0)
+			throw Error("Function start missing");
+
+		$$(__ + '4.6 - Save the address after the code')
+		const beginAddr = addr + code.byteCount();
+
+		$$(__ + '4.7 - Find the limiting comparison for hairstyle')
+		const prefix =
+			" [01111.00] 05" //jl/js short _skip#1
+		+	CMP(R32, WCp)    //cmp regA, <limit>
+		;
+
+		const suffix =
+			" [011111.0] 0?" //jl/jle short _skip#2
+
+		addr = Exe.FindHex(prefix + suffix, beginAddr, beginAddr + 0x50);
+		if (addr < 0 && doramOn)
+		{
+			addr = Exe.FindHex(prefix + suffix, beginAddr + 0x100, beginAddr + 0x200);
+		}
+		if (addr < 0 && !isLast)
+			throw Error("Limit checker missing");
+
+		$$(__ + '4.8 - Fix the CMP')
+		fixCmp(addr + 2);
+
+		$$(__ + '4.9 - Repeat when doram specific section is present (only for the spr & act)')
+		if (idx === 0 && doramOn)
+		{
+			addr = Exe.FindHex(prefix + suffix, addr + 5, addr + 0xB0);
+			if (addr > 0)
+				fixCmp(addr + 2);
+		}
+
+		$$(__ + '4.10 - Find the table assignments (MOV or LEA regA, [regB*4 + regC])')
+		const isLEA = !isLast && strAddrs.length == 3 && Exe.BuildDate > 20110922;
+		code = isLEA
+			? LEA(R32, [4, R32, R32])
+			: MOV(R32, [4, R32, R32])
+			;
+
+		$$(__ + '4.11 - Filter out the false matches')
+		const addrs = Exe.FindHexN(code, beginAddr, hookAddr).filter(addr =>
+		{
+			const ins = Instr.FromAddr(addr);
+			if (ins.BC_Disp > 0)
+				return false;
+
+			if (isLEA || strAddrs.length < 3)
+				return true;
+
+			const ins2 = ins.getNext();
+			const ins3 = ins2.getNext();
+
+			if (!isLast && ins2.Codes[0] === 0x52 && ins3.Codes[0] === 0x8B && ins3.SIB != undefined && ins3.SIB.Scale === 2) //PUSH EDX followed by MOV r32, [r32*4 + r32]
+				return true;
+
+			if (ins2.Codes[0] === 0x8B && ins2.BC_Disp > 0) //MOV regA, [regB + offset] followed by
+			{
+				if (ins3.Codes[0] === 0x52) //push edx
+					return true;
+
+				if (ins3.Codes[0] === 0x8B && ins3.BC_Disp === 1 && ins3.SIB == undefined) //or mov rega, [regb + disp8] where regB is not esp
+					return true;
+			}
+
+			if (ins2.Codes[0] >= 0x50 && ins2.Codes[0] <= 0x57 && ins3.Codes[0] === 0x68) //push eax
+				return true;                                                              //push offset <formatStr>
+
+			return false;
+		});
+
+		if (addrs.isEmpty())
+			throw Error("Table fetchers not found");
+
+		$$(__ + '4.12 - Fix the tables')
+		addrs.forEach( fixTbl );
+
+		if (!isLast || !isPalShared)
+		{
+			if (isLast)
+				Exe.BeginTag('SHP');
+
+			$$(__ + '5.1 - Calculate the base stack offset for retrieving the argument')
+			let offset;
+			if (ROC.HasFP)
+			{
+				offset = 4; //for the 'push ebp'
+			}
+			else if (type === 1) //Older VC9 function signature
+			{
+				offset = 4 * 4; //there are 4 PUSHes in total. We could calculate it but seems like a waste.
+			}
+			else //Newer VC9 function signature
+			{
+				offset = 4 * 3; //for push -1, push offset#2 and push eax
+				offset += Exe.GetInt8(beginAddr + 2); //from sub esp, immA
+
+				code =
+					PUSH_R.repeat(3)   //push regA
+					                   //push regB
+					                   //push regC
+				+	MOV(EAX, [POS3WC]) //mov eax, dword ptr [offset#3]
+				+	XOR(EAX, ESP)      //xor eax, esp
+				+	PUSH_EAX           //push eax
+				;
+				addr = Exe.FindHex(code, beginAddr + 3, beginAddr + 0x20);
+				if (addr < 0)
+					throw Error("Register PUSHes missing");
+
+				offset += 4 * 4; //4 PUSHes from that
+
+				code = Exe.GetUint8(addr - 1);
+				if (code >= 0x50 && code <= 0x57) //if additional PUSH reg is there before it
+					offset += 4;
+
+				if (Exe.BuildDate > 20111105)
+				{
+					addr = Exe.FindLastHex(PUSH_R.repeat(3) + LEA(R32, [sreg, WCp]), hookAddr, hookAddr - 0x20); //push reg *3 and lea regA, [sreg + disp8]
+					if (addr < 0)
+						throw Error("Final Reg PUSHes missing");
+
+					offset += 4 * 3; //3 PUSHes from that
+
+					code = Exe.GetUint8(addr - 1);
+					if (code >= 0x50 && code <= 0x57) //if additional PUSH reg is there before it
+						offset += 4;
+				}
+				else
+				{
+					offset += 4 * 3; //It's always 3 arguments going into the function before the format
+				}
+			}
+
+			$$(__ + '5.2 - Construct the function argument required (which contains the hairstyle number or a pointer to it - in the case of spr/act)')
+			const arg = Exe.BuildDate < 20111108
+				?  [sreg, offset + 4 * (isLast ? 1 : 2)]
+				:  [sreg, offset + 4 * (isLast ? 2 : 5)]
+				;
+
+			offset = isLast ? 4 : 8;
+
+			$$(__ + '5.3 - Construct our code')
+			code =
+				PUSH_EAX          //push eax
+			+	ADD(ESP, offset)  //add esp, 4/8
+			+	MOV(EAX, arg)     //mov eax, dword ptr [ARG.5/ARG.2 or ARG.2/ARG.1] ; latter for palette
+			+	(!isLast
+			?
+				MOV(EAX, [EAX])   //mov eax, dword ptr [eax]
+			:
+				''
+			)
+			+	MOV([ESP], EAX)   //mov dword ptr [esp], eax
+			+	SUB(ESP, offset)  //sub esp, 4/8
+			+	POP_EAX           //pop eax
+			+	PUSH(strVir)      //push offset <format string>
+			+	JMP(Filler(1))    //jmp <retnAddr> ; Return Address is after the PUSH
+			;
+
+			$$(__ + '5.4 - Prepare the arguments for auto-hook')
+			const args =
+			{
+				targets : {
+					1 : Exe.Phy2Vir(hookAddr + 5, CODE)
+				}
+			};
+
+			$$(__ + '5.5 - Add our code and jump to it from hookAddr')
+			AutoHook(hookAddr, code, args);
+
+			if (isLast && doramOn)
+			{
+				$$(__ + '6.1 - For doram palettes find the seperate format string')
+				const newStrAddr = Exe.FindText("%s\\" + fmtPrefix + "%s_%s_%d.pal", PHYSICAL);
+
+				if (newStrAddr > 0)
+				{
+					$$(__ + '6.2 - Change the second %s to %u')
+					Exe.SetInt8(newStrAddr + 4 + fmtPrefix.length, 0x75);
+
+					$$(__ + '6.3 - Find where it is PUSHed before the original format string PUSH')
+					const newStrPush = PUSH(Exe.Phy2Vir(newStrAddr));
+					const newHookAddr = Exe.FindLastHex(newStrPush, hookAddr, beginAddr);
+					if (newHookAddr < 0)
+						throw Error("Second palette format string not PUSHed");
+
+					$$(__ + '6.4 - Construct the code for doram palette')
+					const code =
+						PUSH_EAX          //push eax
+					+	ADD(ESP, 8)       //add esp, 8
+					+	MOV(EAX, arg)     //mov eax, dword ptr [ARG.2/ARG.1]
+					+	MOV([ESP], EAX)   //mov dword ptr [esp], eax
+					+	SUB(ESP, 8)       //sub esp , 8
+					+	POP_EAX           //pop eax
+					+	newStrPush        //push offset "%s\<fmtPrefix>\%s_%s_%d.pal";
+					+	JMP(Filler(1))    //jmp <newRetnAddr> ; after the original PUSH i.e. newHookAddr + 5
+					;
+
+					$$(__ + '6.5 - Prepare the arguments for auto-hook')
+					const args =
+					{
+						targets : {
+							1 : Exe.Phy2Vir(newHookAddr + 5, CODE)
+						}
+					};
+
+					$$(__ + '6.6 - Add our code and jump to it from newHookAddr')
+					AutoHook(newHookAddr, code, args);
+				}
+			}
+
+			if (isLast)
+				Exe.EndTag();
+		}
+	});
+};
+
+///
+/// \brief Makes the mid-headgears that depend on the hair styles use idx 1 when going over the max known value.
+///
+IncrHairs.stage2 = Warp.Execute([
+	" AB EF A7 E4 32 36 C6 E3 47 80 16 EF E2 31 84 07 B9 39 C4 4F 85 70 A2 E1 2A 72 75 C8 4D B6 1B 8E 74 04 00 00 8F 1B 92 FA 2D 7B A4 CD BA F1 8E EF 82 FF E9 6B A8 BC 91 40 15 7F 05 5C 54 46 8A 9F 2F E3 52 B6 6E 94 0B E4 B0 AE EB 40 A4 6A 43 97 F3 E1 B5 55 F1 81 68 15 D6 1B E2 91 ED A6 14 F8 DB 45 79 85 C9 69 64 53 F0 3A E6 41 A6 70 BB 8F 08 CA 84 86 5E CD B4 02 A1 0E 5D 7E 09 78 BE 33 EA 15 F2 29 D1 50 02 0E E8 3D CB 18 AD 2D BD 7D 0A 87 85 E7 81 03 31 8F AD E6 1C E1 6D 5E 73 BC A9 56 BB D9 A5 CC 5A 08 24 BB 53 5A 33 76 17 AC 97 67 16 E8 FC F2 2C 39 D4 5D BD 77 99 11 69 B0 22 CB 28 E6 A8 40 87 6C B0 42 6D 7A 2C 4A F3 72 7D 9A 94 57 4D 38 D5 D9 49 54 8D A3 7F D6 70 6A FC 72 C7 54 74 B6 84 0E 25 8C E9 E3 F1 DA 35 94 F2 DE 3E 78 C7 A4 81 89 AC 5E 46 3E 31 C8 A6 39 BC 80 80 F7 1B CF FA 96 2C 48 3A 67 74 8C DB 93 B8 BE 20 73 B4 06 05 50 BA 6C 0B CD 0B 5F 37 DA 3E F1 E7 5D 6C 16 7A EB A9 EA F5 BA 74 D1 0E A8 62 D0 38 1A FF E2 25 0F 67 9E 32 D3 8E 0A 85 7A 74 B0 50 BF EF 56 65 28 2F F6 4B 60 07 D2 9F 6A 77 1E A0 0C 00 0B E0 DD 47 A2 5F DB 10 8E B5 FD 02 14 D5 02 2F 76 ED FB E6 0C E9 E8 D7 94 0C 14 64 B3 C4 C5 00 1C 2F A8 FC 90 14 38 5B DF 84 B7 41 04 8A 51 5F 07 C7 F3 09 B5 99 BE F8 06 B1 46 9F 5C 34 61 90 64 AD DF 9F D3 33 C7 12 71 95 AC 6F 35 90 B8 B9 70 54 D6 9E 9F 92 13 F1 49 A8 E1 C1 C2 B8 55 D9 09 28 2C EB B5 1F 0C A6 98 3B B5 12 00 36 01 63 D6 81 F5 61 83 40 68 C6 0F 7F C6 C0 D8 A7 C7 8D BB F1 06 0E 16 FF 02 71 05 BD 47 A1 47 BC DD A4 BE C1 88 BF 79 9A A0 5C 4A 71 16 91 03 91 69 91 0F 03 9E EB 81 C7 F7 CE F1 4B A1 59 73 AF 70 66 6C 21 AC A8 25 77 B8 E5 7D",
+	" BB 38 77 E2 12 58 89 D2 0E 88 E7 50 38 A4 41 1C 6C C3 51 14 E8 36 5E 63 DD 19 33 78 D4 27 D9 51 44 57 CF 34 38 99 B9 30 1B 84 95 F4 93 97 5F E5 5B D2 E1 5A FC 63 B1 0E DA 88 D9 12 C4 87 51 80 49 70 2D 0E CD 13 2B 1E 61 96 76 92 AC B3 72 F6 CD D8 A1 2D 69 71 EB 76 0E C4 78 B2 C5 DA 8A 29 26 FA B6 F5 BA 48 19 71 61 D7 E3 CF AB CD 14 6B 23 42 31 AD F5 CA 26 44 61 BD 69 9E F1 3C 28 F4 8A 8E 4B 9A E8 A5 21 63 00 63 ED 73 83 EF 1C 67 3C DF 37 90 95 27 B3 26 7E 5E 7A 51 67 62 9E 91 30 6D B3 E6 54 CA 44 0B 10 E0 94 9E BF 6A 4A EC F1 39 E1 91 23 80 8C 1B 30 6D AC EE C7 5B 72 68 D2 4D FC 21 33 D7 5A 6D 43 23 EE 5A 4F 9A 11 9F 83 6D 19 13 7A F0 F8 78 DB BD FA 69 9E 08 F1 BA 54 04 48 69 32 38 CA 35 43 23 A3 3E F0 0F 42 F9 ED B8 AA 4D EC AC 08 44 C4 4C 17 1D 3A 74 A7 F4 2F CE AD FF 39 EB 37 99 46 F4 E9 4A E9 52 A7 A8 70 08 52 10 8B C9 77 72 BB 88 06 C6 DB 90 2B DE BB 98 6D 34 6D 27 59 72 0E 80 66 B6 60 E9 3C EB 33 74 C4 CB 0F 5B 3A 49 8A 29 33 D3 F7 30 F4 6A A4 FA A4 22 0E 50 C7 E9 5B 41 40 05 E6 E1 64 74 B0 60 15 33 D4 A4 92 99 6B FD 6B 24 12 73 A0 37 11 3F 4F D0 3C 6F D8 1F ED D2 8E BD B3 67 2E EC 19 F0 4A 6A DC 9F 44 71 27 AD 45 E7 BE 94 DD C0 B2 22 A5 BD 67 31 6E 50 E8 DE 36 FC 21 AC 84 DA D3 23 FB 7B 67 C2 6D DF 8A 4C 40 4D DA 9C A5 EA E0 0A 8E 2C C1 F0 C0 C7 1F 1F C2 45 CB 99 C0 40 5C F7 68 4E C2 E7 98 F8 3B DE A9 32 49 3E 96 7D 51 8C FF 5B DC 1C 14 2F 61 50 E3 35 C9 C9 7A E4 C4 FE 56 8A 19 B1 F0 95 53 A2 0D 9A 99 23 2F B9 80 6F 62 FF 3C 68 27 6A B4 80 9B C8 28 F8 75 2C 25 89 B4 67 31 16 DA 6A E8 1C AA A9 A5 EE D3 27 EF CF 11 FA 61 7A A0 46 C3 0C 54 4B 4C EB",
+	" 37 67 3B DB FD 00 0E 70 5D 52 28 65 0A 1C 51 EC A7 6A 7C 37 99 ED 34 DC 54 04 00 00 3D DA 52 49 D8 88 D3 64 D7 4E D1 C3 9D AF 7F 9F 6B BF 38 1F 26 6B D8 33 52 B6 9D 6E BF 8C 4D B0 91 86 A7 92 20 29 56 D6 E5 0A 89 3D 6D 16 3C B8 79 D8 69 CC 6F DC 70 08 ED B4 A9 BC E1 90 76 57 62 D7 44 A1 89 1C 9D F6 81 6B 0C 02 C3 D0 3F 68 B9 17 D1 2F 73 04 90 13 3F E8 D5 DB 95 A1 23 FE C7 16 B4 DB 8A 1C 94 20 48 A7 BA B0 B5 18 9F CA 6B F7 5B FA C6 33 A1 5A 9C 28 94 3F 0F 5D CB F6 E3 1A 0C A4 CD 82 8F 33 C1 8A D5 CF E2 98 B1 D5 9A 57 4D 62 BE C4 D7 78 CD 2A A3 49 32 25 FD AF 6A 49 FF 5D 65 A8 88 74 92 E4 58 CA 88 9B D1 D6 53 93 41 3C D1 8D D7 0D 8E 36 EA EA 87 ED 0B BE 7B 89 94 7D 8E 45 35 BD FC 54 FD 1D 40 99 1E E4 0D 90 0D 20 CA 52 32 CC F3 27 BD A4 14 41 67 E3 A7 33 E5 21 05 C8 C4 8E 6A 15 88 72 5E D8 97 67 DC B0 04 28 65 95 32 88 9D 9B 3C E3 F5 DB 82 06 4D BB 59 33 26 A0 67 82 26 C0 11 52 85 26 2C D5 D1 E3 5E 1C 14 7C A5 82 8A 03 1E 27 F9 14 95 39 82 7E 20 40 AF 19 AF 8D CC A5 3F B2 E3 3E 4D CE 6E B0 CA B5 7A A4 3A 9B 01 0E DA 0F 7C 99 90 78 A9 8C 48 7A A1 F4 96 2B 5D D8 65 18 05 85 A6 94 AF AC C4 C8 29 A9 72 4F F5 D2 8F 8D 5B 51 E8 89 7F 47 B5 DD 3C C4 E3 AA 5F 80 0D F5 AA 5F 0D CF FF 6A 4C 9D D0 47 61 46 79 27 D1 66 66 D3 52 68 E7 7D F3 CB 96 FB 5D 0C 20 8A CD 3B 4D A6 27 C7 0E A1 B7 51 0C 85 8F A9 50 91 9C D0 BE 95 F9 43 F6 B3 B4 AE 1D 83 28 28 40 DD F2 2C D7 0C 34 20 9C 6C 9D 5C 3B 4D 32 06 17 D7 63 90 CE A5 B0 C3 3E 6E FD BD 8C 5A 4E 97 6C F8 26 BF 5D A6 C4 D7 CC F8 02 00 74 24 4B ED 9F 8A 30 F3 5F 1C 95 87 6E 90 D4 C1 4B 18 F9 34 8C FF 56 8B A3 F9 CF 44 9A CF",
+	" 4A 09 AB D3 B6 F3 F5 44 21 51 FC 88 22 23 F2 E2 B8 EF 68 66 BD 34 5F 0B 4C 2C 27 65 AD EB 16 44 69 31 0D DE AB 3D 82 28 03 40 1B D8 CD E6 3A 68 C0 AF 9A DE 6E 7A 39 60 48 C0 52 BA 69 BD 38 70 D9 EB 9B 62 86 96 82 93 58 5F CF 8F 27 1A 9B 95 BE 85 A0 D2 02 D0 68 E7 3A 01 DE 76 62 4B B3 BD E7 C4 AF F2 04 F0 62 62 1A D0 43 E8 DA 09 8F 3F 1A 40 78 01 BB 72 D6 3E 70 07 E0 17 BA 25 11 95 CE 1A 0E 2A 6E D5 61 E5 BA A2 20 7D 6A 9A E6 D8 1C D5 49 8E 0D A2 E1 72 B3 B3 19 D8 48 7B EB 01 63 45 10 43 A8 AA 26 A2 0E 38 80 DD FD F6 A2 AE D7 83 80 D4 6C 8D FF ED 3D D9 B8 99 44 BA 02 26 A9 0A 0A 4E FD 77 E8 82 79 73 24 47 B8 12 44 1A 2F A0 26 2E F0 9A 92 6E 0C 24 EC 60 13 AA 41 DB E4 DF 1E B2 F2 67 95 C9 5B 09 F2 7E 6A B8 1F C2 59 01 49 2D 5F A9 37 A6 39 CD 3E 42 41 4D 26 5B E0 37 71 45 89 0E 4C 2E 57 56 77 64 FD EA 1A 83 E1 0B 3D FA 01 AE 36 8D 33 9B F4 B0 08 C5 58 AF CC 55 61 DC 2B 63 32 A9 3B C1 58 E2 65 6B C7 9B F0 20 10 43 3B 01 6E 52 8E 9B 73 B7 D3 5E AE 94 6C 7C 9F 1A 10 E9 A3 FB ED DD 0E 0B 45 1C 53 45 D6 30 A2 C4 9C 2F 64 3A 78 D5 AC E5 41 C5 5C 89 50 C9 B6 A2 7E 4E B4 EE 21 84 5E 0B D1 4D 0B F5 9E 69 4B 32 2E 31 D7 8A C4 CF 46 FC A7 AE 19 D4 01 A8 75 4D DB 64 40 F7 6E 67 61 E4 49 B5 69 9C 18 B0 D9 C2 D7 E6 BD 22 97 AB F5 28 E5 E7 08 B2 35 D0 94 57 B3 1D DF DB 45 DE D9 40 09 51 4F 2B 72 A5 CA F5 D1 58 88 AA 98 DC A9 42 53 82 B7 1A 51 DB BD 87 B0 E6 3E DE 62 D1 10 BE 9D 2A BF 0A 55 0D F4 1B 42 A3 25 E7 D5 53 BC A2 5D 4E 48 AC 3D A9 65 89 BF 21 83 9A 70 6F 70 3F B7 3A 52 CE 41 96 50 88 F7 4F 41 C4 BE 95 C9 43 0C B1 31 BD D9 21 A4 EA 78 A7 FA 58 FB 51 8C D9 6D 66",
+	" 63 B4 87 A2 D8 C9 2D CC 6C BF 62 31 82 74 18 EA 31 57 64 A8 5B 10 67 BD 98 D5 E1 3B DC 2B 8E 30 25 83 6F C9 A9 3E BA DA 69 2A BA 5B 56 5F 2D 77 54 04 00 00 54 E5 9A 2F BB 8A 73 2A 1E A8 1E E8 FE 35 69 A8 0D 7D 8D 7F D7 80 E3 D3 37 A7 51 6C 84 86 B3 04 06 FD CB 12 45 2D 77 9A DD B0 3F BA 83 7D 24 A5 F6 38 E4 71 D7 22 59 5D 93 FA 40 4A 5C 4B 54 71 64 4F C3 95 EC D5 10 AC 80 F4 09 C8 5D FC 98 35 80 B7 A3 1C 95 4C 0D 4B C4 3B 30 73 14 79 F7 EB 87 2B 81 AA 70 8E 65 BE CA 37 BC 83 0A 89 A8 37 F1 33 23 9D 55 7E 9A 01 CD 8C A3 FF 69 60 00 60 DB 22 F3 21 9A 9A 1C 5D 1A 90 67 99 9B B3 12 89 B2 F9 09 C2 EA 08 5A 54 CE D2 A0 B1 C7 C8 66 97 68 E6 36 CD 5F B0 FA 35 86 7B 2B B1 D4 9E E9 33 54 CD 73 4F 45 3B A0 A3 AA 1F 6F 24 A2 68 20 8A CE C7 61 91 08 59 2B 4D 21 60 75 72 59 96 DF 9D 75 85 46 64 7B 81 B6 33 2B 54 93 17 CD 27 22 90 D5 EF 81 B3 62 E0 C1 33 9B CA 32 AC 53 9A 02 0D 97 D5 4A A1 80 01 B1 9F BC 4F AA E2 D2 11 F1 9D 8B AC AF 99 7C 78 C8 B0 7B 94 D6 75 F9 2B 9E D5 AD A7 9B EB 15 51 3C 33 8C 5A E5 D7 1E DA 55 A1 6B 60 7A 1B E8 38 27 FE 97 CD DF 74 CF 46 0A 69 00 82 28 75 F1 8F 28 41 AC 96 D2 FD 97 7D 57 FB 56 06 C2 05 88 CB 9B 8C 10 8C E4 FE 22 89 E5 CB E0 EE 48 73 0C CB 3A C9 D3 05 8D D7 70 BC 49 EE 13 BF 6F C1 FD 48 8E 65 4C 1C 7A D6 9C 5A C0 93 80 BB B7 5D 54 8F 9A 45 CF 8F 81 68 48 34 3F 3B BE EE 54 06 B1 05 34 D6 E0 93 66 5C DC 94 E5 36 9F 50 74 A0 D5 A5 40 9A 39 42 9C 6B F4 75 68 D6 22 AC 68 54 BD 9D AE 50 22 3A 09 DF 73 5B D1 83 A6 96 18 0B 28 A2 6F B5 AB CD 04 A8 80 F2 D2 17 84 4C C7 0D 9F 7F 0D 45 F2 56 C5 C2 80 A1 0D E4 5D 4A 0B 86 FA D2 AC 0E AB E7",
+	" 45 BF B3 EF 32 E1 80 C1 C5 6C 08 65 0F 90 4A AF 25 93 5D 55 DA 55 94 BA 37 12 FD FD A3 33 B8 2D 94 58 98 8C ED DE 0C 1C 29 35 40 E7 5D 4D 4D 45 C0 63 03 D1 0B 53 93 5E B0 6A DA 42 55 84 7B 50 87 A2 91 6F B1 01 6D 7A BB 9A D8 10 30 2E 15 D0 01 7A 8E 4A C7 36 E8 BD 74 08 15 0E 1F 5D 1B 2A 93 1A AF 93 62 A8 C0 05 79 BA 64 ED 13 3F F4 0F ED BE E7 EB EB 4A 54 CA 39 23 5D 41 80 2F 95 A6 69 FF F4 57 9F DD F6 69 1E 26 26 5E 83 92 48 1E AF CA 38 98 A3 14 80 2A 6B 8D DF 26 11 46 ED 1A F8 6C F1 0D D2 0A 8C 54 E0 8B 76 64 27 D9 D8 CB 81 E6 38 55 1C F2 72 E7 0D 14 20 42 90 07 90 26 0E E2 8C 59 77 6E 75 92 B4 8B 34 EF 1D C8 1C 45 68 00 6F 6C 9D 3B A8 73 03 13 35 71 07 20 63 C1 9E 91 02 E5 0A FF 24 7B 15 4F 57 79 13 9E B7 FB A7 0F 21 CC F7 11 BC 61 E6 CC 17 EA CC 35 B1 98 C1 F9 14 F7 B3 31 34 05 BD 8D F4 26 56 01 73 64 61 46 46 34 35 E5 2A E5 C5 0F 55 E4 3E CB 0C D5 7F AE 68 D7 8B DF 27 9A 7C 05 25 01 97 D7 E0 84 78 31 AD 98 A1 5D D4 8B 21 2D CF 05 1A 7C 6B 7A 35 E4 3C 86 31 42 4F 6D 10 11 FF 79 E3 DA CC 62 18 32 5E F9 20 DD 65 1F D9 31 EB C3 36 7F 1B 53 B6 E5 F6 B7 44 1A CE B1 23 3B B7 B2 D0 6D 44 64 33 C7 7A 90 6E 63 0D A6 3C DA 4F 68 1D FB 82 AC 5E 92 21 F0 FD 08 BE F8 1A 23 2B 0D 66 6F CB 50 CB 15 5E 8D 20 72 65 2A CD 77 7F ED 26 3E E6 32 31 48 D9 B1 EB E7 20 A4 F3 C0 6A 66 2D 55 06 AB 21 6D F2 64 C8 45 D5 75 BE 29 F7 46 E8 2B 67 3F C1 5B 4B E3 08 57 0D AA 85 57 3B 17 45 E1 26 63 AF FD 45 AF 34 67 7C DE FC 3B EE F2 4B 04 CB 93 EF 92 5F 14 59 96 3C 2A A2 7E 78 F3 27 95 63 A5 A4 F9 4B E7 9D 23 7B 31 7F E8 29 73 BF 22 AC 21 B1 FC BA 42 D3 ED CE 4D 25 8D 53 4E 96 6E",
+	" 99 89 D1 77 9E 0B 4E B5 54 04 00 00 A7 5F 36 1F 4E 3E 55 E1 9D 4B 71 66 96 C7 D2 43 75 AB 24 C0 40 CC 32 82 8F C9 F2 BD 3C 67 A1 02 8D FA DE 77 B6 CC 27 24 71 83 D3 8A AC C7 42 EE 5B 2E 98 E4 C2 0A E5 BF 0B B8 BF 34 BD 3E 76 4F 78 42 68 6C DE FA 1C 5E A7 59 29 AB 05 DC F8 51 C9 78 63 BC 16 DC 37 FE 64 A9 19 8B C9 93 01 55 C5 6E 49 E5 05 C0 AD 1C 65 9A 14 0C 76 55 EF AC 62 36 EB D5 EB 2F 0E 22 CE 7F 91 29 BA 02 26 22 CB D6 9F E3 33 1A AB AB B6 29 F9 1A DF ED 14 90 08 87 5F 20 90 D8 EC 26 75 D7 BC 77 7F C8 73 A8 9A CB 23 F2 0C BB 94 46 6F 18 A2 27 6C CF 2C 2E 8D D5 95 25 85 CA FC 05 01 5E E6 A0 96 F8 59 C8 7D CC 85 A7 AB B5 3E 69 6B BC 72 BC 22 BD 2B 78 E5 AA E0 B6 EB 79 07 2B CB A6 93 4B 92 C3 0E 12 69 70 67 B5 FF DE 76 F1 64 59 BA D1 EA 17 5D B9 63 45 9C A8 A4 33 12 AD 97 72 68 2A 0C BE F7 0E CA F9 8D 7E 5A 48 AD C4 F6 54 C9 F1 D9 E1 E5 B7 16 F2 B3 8C 3E 63 97 81 86 E4 13 55 2F 3D F9 B8 BF 72 6B 63 A2 0B 1C 20 38 17 0C 28 13 33 CC 90 D2 38 5E F1 BD 0E 83 D9 BA A5 54 59 D1 D0 CB CE 10 9F 89 17 C1 6C EE 05 4E 5A 31 BD 9F 88 D7 B1 3D 31 76 BF 57 DF 80 D4 93 1D 7C 90 EF 2F B5 8B 11 8E 8C 59 0D 3D D9 0E 9E 7D B3 00 D9 D0 80 12 89 23 47 62 81 3C C5 06 85 1D 6E 6E B5 DC 77 FF 4B 04 71 FC 2A 17 08 79 54 D0 65 2B 18 C9 94 85 F4 3E 0A 13 95 95 2E 39 EC 6F 9A 45 C1 F7 87 46 CD D5 55 88 D1 E8 D5 84 05 95 93 82 B5 7F D7 3B 58 46 8C 5C 00 E5 56 00 4E D7 D5 C8 2E D5 5E 45 63 12 5D 06 DB 42 BE 5D 3E 0F 6B 1A 61 55 6D 18 CA B0 88 9C 0C 9D 03 4C D4 B7 AD 34 88 4A 8A D5 16 66 0E DC A8 F6 AA 6A 65 CB 8D CF 85 06 5E FC CB BD B3 FE 94 BE CC 6F F3 2B 90 4C BE 13 CF BD DB D8",
+	" BF 3D 69 9C CB 92 3B 04 A8 34 CC F2 7C 2A 72 60 49 85 91 31 78 69 5F 10 73 C7 9D 6A 4F 31 91 E6 F4 E8 3C C9 D0 48 D5 CC 63 37 6C E5 C4 10 CB 5F 64 36 06 CC 05 E1 1B 6D 24 3D D1 36 CD EE 97 CC 7A CE 90 66 14 9C 3F 6B 62 6D A7 B0 20 93 2B AF 92 BB 16 FD 5E 30 DD 98 D5 F6 78 D5 A7 C8 90 15 A8 90 47 4D 6F A6 B5 3A 94 AC 5B 11 CC 32 D1 82 BF 2D 6A 6C 3D D0 14 98 40 7B 8C BE 98 19 6A 83 A7 C3 89 25 16 D7 EC E2 5B 30 4F 0A 30 A6 DC 4E 49 47 33 E6 61 A9 58 F6 E8 EE 6A 37 73 4C EA BD EB D0 0A 97 A7 5C 68 E7 05 37 30 49 EC 3D 21 A9 61 77 1A 76 36 E8 94 5C B8 06 B6 C2 A9 7A B3 44 CF 28 22 18 9E DF B5 61 A4 42 5E D6 CD 7B 3A 53 5D 00 DA CB 36 DE DC C4 B6 2D 3C 4D B3 D3 41 84 D1 72 18 C5 33 2F BB A8 3A FA 16 6C 02 9E C0 6B 60 DA D1 5D 1F 97 34 86 BB F7 E9 9B A8 00 21 03 63 0C B1 4E DD E3 51 C3 BC 50 E7 A2 59 8D A8 BB 60 C5 9C B4 DA 4B EF 05 D8 28 17 D4 6D A4 CC 5F 50 5B B6 D9 1E CF 6D 2A 5F B3 04 DE D2 59 F1 0A B8 F2 88 9B 93 9A AB 13 A6 A4 C1 0D DF F9 CD 61 F9 54 EC 68 3D 00 E1 D4 35 C4 5B 6C C9 A1 B1 17 4B D4 75 EE F9 B6 1F 7D CE D4 D6 63 9C 47 57 CF 4C BA 8C C3 28 08 B1 6D 82 38 D5 70 E9 9D 98 68 40 18 C5 65 3F 54 8A B8 24 EC 7D 3A 1B A6 80 5D 33 DF 66 A9 E5 97 C1 BD DE F4 16 F0 F0 8B 5D AE AF 1F 47 60 E8 51 BC 7E 1D 2E 04 D1 F1 41 6D 06 81 24 A7 5A 6D A4 48 C6 61 14 D7 7C 04 57 C3 5A E8 B9 51 31 08 2D E8 5B 3C 79 DF 20 CA 61 60 64 32 5D 6B F0 92 7F 49 E4 33 B7 54 91 21 CB 3E 3F 5A 04 CF 97 F3 82 40 B2 28 AE B0 94 09 57 BB 50 6B 9B 63 FC 4E C8 17 EE 69 AF 45 BC 58 63 E3 81 37 3E B3 B6 DC CF CB E0 71 EF 48 2D 3D EF 0F 04 AA 95 EA 5A 06 DD AB 80 1E 5E 01 88 E5 A7"],
+	" BF E8 24 67 F5 82 34 58 8E 72 68 CE 18 97 82 08 3B C7 8F 33 BC DD 80 80 F5 A2 05 81 25 4C A9 40 4A 29 7B 84 41 AB 36 97 AA 7D 98 D1 86 45 70 B7 9C 20 22 46 64 2D 08 B8 8C FF 68 4E 59 40 0D 9A 25 62 D6 93 97 5F F7 95 5B 2E 4D 98 4D E6 FA 9B 06 B7 78 8A F7 EB DC 61 BB 06 DD 39 8D 4B 20 F6 64 F9 A5 1B B9 F0 38 35 65 52 47 40 32 27 15 50 C2 59 CF 06 32 7A CF AE B4 7C 97 47 38 87 64 4F 2A 62 48 32 EB DF 85 DA 60 8F DD AA 7B EF DC 55 7A D0 DF E2 7F 9D CD 35 E4 D8 30 75 1B B7 84 A8 65 DE 34 5B 9A 03 F0 3D 0D BC 01 74 D3 AA CE 94 DD 7F 7C EB 30 B0 11 B1 E1 DC 2E 52 E6 33 88 89 BB D2 07 24 AD CF 89 F8 77 15 BD 33 B0 C1 62 B9 12 2C FC 0F C3 5D F5 87 58 AA 63 4E 49 A1 9F BF E5 D7 1A C3 7B 25 68 1C FC B4 F3 96 C3 BE 7D 11 D5 83 75 7B EB AA 39 59 CC 85 C3 1F 08 99 C9 BC 6A D5 40 FB 82 07 36 A8 6F 72 5E A4 D0 D3 3D 5A 75 C5 E2 6E 73 B7 39 CA C3 3E 4A BA 3E 63 64 EE 8C 78 BD 71 B6 E3 32 AF 67 F4 07 68 0B 50 F4 A2 DC BD 83 59 A9 8E 8B CE 83 4A 3A 3C 50 22 49 48 15 71 89 99 A4 FC 8A 95 B3 F7 26 00 30 D4 3E EC A7 D6 13 E6 47 38 63 65 9E 76 B1 30 EA FD 6B 2C FA 3F 36 CA BC FF 3C 2D 5F 7F 4B 4C FE E4 7B 85 AC CC 7E 5B 84 10 60 6D C2 C1 81 58 C0 89 AA 79 2D FA B9 FE 09 B4 57 47 2B 3E 96 D8 9D 6B 76 54 8F 36 9A BE 12 3B CE 79 2C 6D 50 BD CA 40 AC A5 00 D0 B4 19 61 C3 34 84 1F 0D 9C 8D 2C 95 BB 7D 7E A3 1F CD 2D 6D 1E A4 92 68 27 A4 6F 0E F3 FE FC BD 60 70 DE E4 7C B2 3C D1 4B F3 AB A4 C2 48 A2 26 85 BA A9 3B D1 8A 90 84 C8 6C 64 99 0C 78 98 F6 76 7A A1 BC 22 EE 7A 3E A8 81 69 7C B2 0E 5C 19 D3 16 CF 31 88 71 4F 1B F2 03"
+);
+
+///
+/// \brief Wrappers for individual patches
+///
+Allow65kHairs = IncrHairs;
+IncrHairStyles = IncrHairs;
